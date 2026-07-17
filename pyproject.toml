@@ -24,3 +24,5 @@ app_email = "accounts@finspreeglobal.com"
 app_license = "MIT"
 required_apps = ["frappe", "erpnext"]
 
+[tool.bench.frappe-dependencies]
+frappe = ">=15.0.0,<16.0.0"
