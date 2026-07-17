@@ -1,0 +1,26 @@
+[project]
+name = "pramo_kcb_integration"
+authors = [
+    { name = "Pramo Traders", email = "accounts@finspreeglobal.com" }
+]
+description = "KCB Buni integration for ERPNext"
+requires-python = ">=3.10"
+readme = "README.md"
+dynamic = ["version"]
+dependencies = [
+    "cryptography>=41.0.0"
+]
+
+[build-system]
+requires = ["flit_core >=3.4,<4"]
+build-backend = "flit_core.buildapi"
+
+[tool.frappe]
+app_name = "pramo_kcb_integration"
+app_title = "Pramo KCB Integration"
+app_publisher = "Pramo Traders"
+app_description = "KCB Buni integration for ERPNext"
+app_email = "accounts@finspreeglobal.com"
+app_license = "MIT"
+required_apps = ["frappe", "erpnext"]
+
