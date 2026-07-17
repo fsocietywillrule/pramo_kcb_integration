@@ -1,2 +1,1 @@
-cryptography>=41.0.0
-
+# cryptography is provided by the Frappe/ERPNext runtime stack on Frappe Cloud.
