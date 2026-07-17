@@ -19,6 +19,31 @@ CALLBACK_METHODS = {
     "kcb_validation": "Validation",
 }
 
+# The "KCB Integration Log" Processing Status field only allows these values:
+# Received, Duplicate, Pending Spec, Pending Signature Setup, Pending Config,
+# Processed, Error. Every internal status string used below must map to one
+# of them before being written to the doc.
+STATUS_MAP = {
+    "Received": "Received",
+    "Duplicate": "Duplicate",
+    "Rejected": "Error",
+    "Verified": "Processed",
+    "Verified - Log Only": "Processed",
+    "Payment Entry Created": "Processed",
+    "Pending Manual Review": "Pending Config",
+    "Payment Entry Failed": "Error",
+    "STK Push Sent": "Processed",
+    "STK Push Failed": "Error",
+}
+
+# Mapped statuses that should NOT block a transaction_reference from being
+# retried by _log_exists().
+NON_BLOCKING_STATUSES = {"Error", "Pending Config"}
+
+
+def _mapped_status(status: str) -> str:
+    return STATUS_MAP.get(status, "Error")
+
 
 def _request_payload() -> dict:
     if frappe.form_dict:
@@ -317,7 +342,8 @@ def _insert_stk_log(company: str, invoice_name: str, payload: dict, response_pay
     doc.merchant_request_id = response_payload.get("MerchantRequestID")
     doc.message_id = payload.get("messageId")
     doc.received_on = now_datetime()
-    doc.processing_status = status
+    doc.processing_status = _mapped_status(status)
+    doc.error_message = status
     doc.linked_sales_invoice = invoice_name
     doc.raw_payload = json.dumps(payload, indent=2, sort_keys=True, default=str)
     doc.response_json = json.dumps(response_payload, indent=2, sort_keys=True, default=str)
@@ -334,7 +360,10 @@ def _log_exists(transaction_reference: str) -> bool:
     return bool(
         frappe.db.exists(
             "KCB Integration Log",
-            {"transaction_reference": transaction_reference, "processing_status": ["!=", "Rejected"]},
+            {
+                "transaction_reference": transaction_reference,
+                "processing_status": ["not in", list(NON_BLOCKING_STATUSES)],
+            },
         )
     )
 
@@ -364,14 +393,14 @@ def _write_log(
     doc.phone_number = _first(payload, "phoneNumber", "MSISDN", "msisdn")
     doc.account_reference = _invoice_reference(payload)
     doc.received_on = now_datetime()
-    doc.processing_status = processing_status
+    doc.processing_status = _mapped_status(processing_status)
     doc.linked_sales_invoice = linked_sales_invoice
     doc.linked_payment_entry = linked_payment_entry
     doc.request_ip = getattr(getattr(frappe, "local", None), "request_ip", "") or ""
     doc.raw_payload = json.dumps(payload, indent=2, sort_keys=True, default=str)
     doc.headers = json.dumps(headers, indent=2, sort_keys=True, default=str)
     doc.response_json = ""
-    doc.error_message = error_message
+    doc.error_message = (f"[{processing_status}] " + error_message) if error_message else processing_status
     doc.kcb_endpoint = frappe.local.request.path if getattr(frappe.local, "request", None) else ""
     doc.environment = _environment(_company_config(company))
     doc.company = company
