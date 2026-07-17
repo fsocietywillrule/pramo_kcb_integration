@@ -1,8 +1,11 @@
 import json
+import base64
 from datetime import date
+from decimal import Decimal, ROUND_HALF_UP
 
 import frappe
 from frappe.utils import flt, now_datetime, today
+from frappe.utils.password import get_decrypted_password
 
 from pramo_kcb_integration.crypto import verify_rsa_signature
 
@@ -15,6 +18,31 @@ CALLBACK_METHODS = {
     "kcb_ft_callback": "Funds Transfer",
     "kcb_validation": "Validation",
 }
+
+# The "KCB Integration Log" Processing Status field only allows these values:
+# Received, Duplicate, Pending Spec, Pending Signature Setup, Pending Config,
+# Processed, Error. Every internal status string used below must map to one
+# of them before being written to the doc.
+STATUS_MAP = {
+    "Received": "Received",
+    "Duplicate": "Duplicate",
+    "Rejected": "Error",
+    "Verified": "Processed",
+    "Verified - Log Only": "Processed",
+    "Payment Entry Created": "Processed",
+    "Pending Manual Review": "Pending Config",
+    "Payment Entry Failed": "Error",
+    "STK Push Sent": "Processed",
+    "STK Push Failed": "Error",
+}
+
+# Mapped statuses that should NOT block a transaction_reference from being
+# retried by _log_exists().
+NON_BLOCKING_STATUSES = {"Error", "Pending Config"}
+
+
+def _mapped_status(status: str) -> str:
+    return STATUS_MAP.get(status, "Error")
 
 
 def _request_payload() -> dict:
@@ -147,6 +175,17 @@ def _company_config(company: str) -> frappe._dict:
         "custom_kcb_default_bank_account",
         "custom_kcb_default_mode_of_payment",
         "custom_kcb_auto_submit_payment_entries",
+        "custom_kcb_buni_username",
+        "custom_kcb_invoice_number_base",
+        "custom_kcb_mpesa_callback_url",
+        "custom_kcb_prod_consumer_key",
+        "custom_kcb_prod_token_endpoint",
+        "custom_kcb_prod_stk_push_url",
+        "custom_kcb_uat_token_endpoint",
+        "custom_kcb_uat_stk_push_url",
+        "custom_kcb_shared_shortcode",
+        "custom_kcb_org_shortcode",
+        "custom_kcb_org_passkey",
     ]
     existing = {row.get("Field") for row in frappe.db.sql("show columns from `tabCompany`", as_dict=True)}
     usable = [field for field in fields if field in existing]
@@ -184,6 +223,135 @@ def _find_sales_invoice(reference: str) -> str:
     return ""
 
 
+def _decrypted_company_password(company: str, fieldname: str) -> str:
+    try:
+        return get_decrypted_password("Company", company, fieldname, raise_exception=False) or ""
+    except Exception:
+        return ""
+
+
+def _as_money_string(value) -> str:
+    amount = Decimal(str(flt(value))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    text = format(amount, "f")
+    if text.endswith(".00"):
+        return text[:-3]
+    if text.endswith("0"):
+        return text[:-1]
+    return text
+
+
+def _normalize_phone(phone: str) -> str:
+    phone = str(phone or "").strip().replace(" ", "").replace("-", "")
+    if phone.startswith("+"):
+        phone = phone[1:]
+    if phone.startswith("0") and len(phone) >= 10:
+        phone = "254" + phone[1:]
+    if phone.startswith("7") and len(phone) == 9:
+        phone = "254" + phone
+    return phone
+
+
+def _stk_url(config: frappe._dict) -> str:
+    if _environment(config).lower() == "sandbox":
+        return (
+            config.get("custom_kcb_uat_stk_push_url")
+            or "https://uat.buni.kcbgroup.com/mm/api/request/1.0.0/stkpush"
+        )
+    return (
+        config.get("custom_kcb_prod_stk_push_url")
+        or "https://buni.kcbgroup.com/mm/api/request/1.0.0/stkpush"
+    )
+
+
+def _token_url(config: frappe._dict) -> str:
+    if _environment(config).lower() == "sandbox":
+        return (
+            config.get("custom_kcb_uat_token_endpoint")
+            or "https://uat.buni.kcbgroup.com/token?grant_type=client_credentials"
+        )
+    return (
+        config.get("custom_kcb_prod_token_endpoint")
+        or "https://accounts.buni.kcbgroup.com/oauth2/token"
+    )
+
+
+def _get_access_token(company: str, config: frappe._dict) -> str:
+    import requests
+
+    consumer_key = config.get("custom_kcb_prod_consumer_key") or ""
+    consumer_secret = _decrypted_company_password(company, "custom_kcb_prod_consumer_secret")
+    if _environment(config).lower() == "sandbox":
+        # Sandbox credentials were entered into the same fields during UAT on this site.
+        consumer_key = consumer_key or config.get("custom_kcb_uat_consumer_key") or ""
+        consumer_secret = consumer_secret or _decrypted_company_password(company, "custom_kcb_uat_consumer_secret")
+
+    if not consumer_key or not consumer_secret:
+        frappe.throw("KCB consumer key/secret is not configured on Company")
+
+    token_url = _token_url(config)
+    basic = base64.b64encode(f"{consumer_key}:{consumer_secret}".encode("utf-8")).decode("ascii")
+    headers = {
+        "Authorization": f"Basic {basic}",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "application/json",
+    }
+
+    response = requests.post(token_url, data={"grant_type": "client_credentials"}, headers=headers, timeout=30)
+    if response.status_code >= 400 or not response.text:
+        # Some Buni examples put grant_type in the query string and send an empty body.
+        fallback_url = token_url
+        if "grant_type=" not in fallback_url:
+            separator = "&" if "?" in fallback_url else "?"
+            fallback_url = f"{fallback_url}{separator}grant_type=client_credentials"
+        response = requests.post(fallback_url, data="", headers=headers, timeout=30)
+
+    try:
+        data = response.json()
+    except Exception:
+        data = {"raw_response": response.text}
+
+    if response.status_code >= 400:
+        frappe.throw(f"KCB token request failed: HTTP {response.status_code} {str(data)[:300]}")
+
+    token = data.get("access_token") or data.get("accessToken") or data.get("token")
+    if not token:
+        frappe.throw(f"KCB token response did not include access_token: {str(data)[:300]}")
+    return token
+
+
+def _insert_stk_log(company: str, invoice_name: str, payload: dict, response_payload: dict, status: str) -> str:
+    if not frappe.db.exists("DocType", "KCB Integration Log"):
+        frappe.log_error(json.dumps({"request": payload, "response": response_payload}, indent=2), "KCB STK Push")
+        return ""
+
+    doc = frappe.new_doc("KCB Integration Log")
+    doc.callback_type = "STK Push"
+    doc.kcb_endpoint = "kcb_stk_push"
+    doc.environment = _environment(_company_config(company))
+    doc.company = company
+    doc.transaction_reference = response_payload.get("CheckoutRequestID") or response_payload.get("MerchantRequestID") or payload.get("messageId")
+    doc.request_id = payload.get("messageId")
+    doc.customer_reference = payload.get("invoiceNumber")
+    doc.external_reference = payload.get("invoiceNumber")
+    doc.status = str(response_payload.get("statusCode") or response_payload.get("ResponseCode") or status)
+    doc.amount = flt(payload.get("amount"))
+    doc.currency = "KES"
+    doc.phone_number = payload.get("phoneNumber")
+    doc.account_reference = payload.get("invoiceNumber")
+    doc.checkout_request_id = response_payload.get("CheckoutRequestID")
+    doc.merchant_request_id = response_payload.get("MerchantRequestID")
+    doc.message_id = payload.get("messageId")
+    doc.received_on = now_datetime()
+    doc.processing_status = _mapped_status(status)
+    doc.error_message = status
+    doc.linked_sales_invoice = invoice_name
+    doc.raw_payload = json.dumps(payload, indent=2, sort_keys=True, default=str)
+    doc.response_json = json.dumps(response_payload, indent=2, sort_keys=True, default=str)
+    doc.insert(ignore_permissions=True)
+    frappe.db.commit()
+    return doc.name
+
+
 def _log_exists(transaction_reference: str) -> bool:
     if not transaction_reference:
         return False
@@ -192,7 +360,10 @@ def _log_exists(transaction_reference: str) -> bool:
     return bool(
         frappe.db.exists(
             "KCB Integration Log",
-            {"transaction_reference": transaction_reference, "processing_status": ["!=", "Rejected"]},
+            {
+                "transaction_reference": transaction_reference,
+                "processing_status": ["not in", list(NON_BLOCKING_STATUSES)],
+            },
         )
     )
 
@@ -222,14 +393,14 @@ def _write_log(
     doc.phone_number = _first(payload, "phoneNumber", "MSISDN", "msisdn")
     doc.account_reference = _invoice_reference(payload)
     doc.received_on = now_datetime()
-    doc.processing_status = processing_status
+    doc.processing_status = _mapped_status(processing_status)
     doc.linked_sales_invoice = linked_sales_invoice
     doc.linked_payment_entry = linked_payment_entry
     doc.request_ip = getattr(getattr(frappe, "local", None), "request_ip", "") or ""
     doc.raw_payload = json.dumps(payload, indent=2, sort_keys=True, default=str)
     doc.headers = json.dumps(headers, indent=2, sort_keys=True, default=str)
     doc.response_json = ""
-    doc.error_message = error_message
+    doc.error_message = (f"[{processing_status}] " + error_message) if error_message else processing_status
     doc.kcb_endpoint = frappe.local.request.path if getattr(frappe.local, "request", None) else ""
     doc.environment = _environment(_company_config(company))
     doc.company = company
@@ -365,6 +536,88 @@ def handle_callback(endpoint: str) -> dict:
     }
 
 
+@frappe.whitelist()
+def kcb_stk_push(sales_invoice: str, phone_number: str = "", amount: str = ""):
+    import requests
+
+    invoice = frappe.get_doc("Sales Invoice", sales_invoice)
+    invoice.check_permission("read")
+
+    if invoice.docstatus != 1:
+        frappe.throw("Submit the Sales Invoice before sending KCB M-Pesa request")
+
+    company = invoice.company
+    config = _company_config(company)
+    if not config:
+        frappe.throw("KCB Company configuration is missing")
+
+    phone = _normalize_phone(phone_number or getattr(invoice, "contact_mobile", "") or getattr(invoice, "customer_mobile_no", ""))
+    if not phone or not phone.startswith("254") or len(phone) < 12:
+        frappe.throw("Enter customer M-Pesa phone number in 2547XXXXXXXX format")
+
+    request_amount = flt(amount) if amount not in (None, "") else flt(invoice.outstanding_amount or invoice.rounded_total or invoice.grand_total)
+    if request_amount <= 0:
+        frappe.throw("Amount must be greater than zero")
+
+    base = config.get("custom_kcb_invoice_number_base") or ""
+    if not base:
+        frappe.throw("KCB Invoice Number Base is missing on Company")
+
+    callback_url = config.get("custom_kcb_mpesa_callback_url") or "https://kitale.c.frappe.cloud/api/method/kcb_mpesa_callback"
+    invoice_number = f"{base}#{invoice.name}"
+    message_id = f"PRAMO-{invoice.name}-{frappe.utils.now_datetime().strftime('%Y%m%d%H%M%S')}".replace("/", "-")
+
+    payload = {
+        "phoneNumber": phone,
+        "amount": _as_money_string(request_amount),
+        "invoiceNumber": invoice_number,
+        "sharedShortCode": bool(
+            1
+            if config.get("custom_kcb_shared_shortcode") in (None, "")
+            else config.get("custom_kcb_shared_shortcode")
+        ),
+        "orgShortCode": config.get("custom_kcb_org_shortcode") or "",
+        "orgPassKey": config.get("custom_kcb_org_passkey") or "",
+        "callbackUrl": callback_url,
+        "transactionDescription": f"Invoice Payment {invoice.name}",
+    }
+    headers = {
+        "Authorization": f"Bearer {_get_access_token(company, config)}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "routeCode": "207",
+        "operation": "STKPush",
+        "messageId": message_id,
+    }
+    payload["messageId"] = message_id
+
+    response = requests.post(_stk_url(config), headers=headers, json=payload, timeout=45)
+    try:
+        response_payload = response.json()
+    except Exception:
+        response_payload = {"raw_response": response.text}
+
+    status_code = str(response_payload.get("statusCode") or response_payload.get("ResponseCode") or "")
+    ok = response.status_code < 400 and status_code in ("", "0", "200")
+    processing_status = "STK Push Sent" if ok else "STK Push Failed"
+    log_name = _insert_stk_log(company, invoice.name, payload, response_payload, processing_status)
+
+    if not ok:
+        frappe.throw(f"KCB STK Push failed: HTTP {response.status_code} {str(response_payload)[:300]}")
+
+    return {
+        "status": "SUCCESS",
+        "message": response_payload.get("CustomerMessage")
+        or response_payload.get("statusDescription")
+        or "STK Push sent to customer phone",
+        "sales_invoice": invoice.name,
+        "invoice_number": invoice_number,
+        "message_id": message_id,
+        "log": log_name,
+        "response": response_payload,
+    }
+
+
 @frappe.whitelist(allow_guest=True)
 def kcb_mpesa_callback():
     return handle_callback("kcb_mpesa_callback")
@@ -393,4 +646,3 @@ def kcb_ft_callback():
 @frappe.whitelist(allow_guest=True)
 def kcb_validation():
     return handle_callback("kcb_validation")
-
