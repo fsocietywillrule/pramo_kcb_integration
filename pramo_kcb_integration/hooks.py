@@ -6,4 +6,4 @@ app_email = "accounts@finspreeglobal.com"
 app_license = "MIT"
 
 after_install = "pramo_kcb_integration.install.after_install"
-
+after_migrate = "pramo_kcb_integration.install.after_migrate"
