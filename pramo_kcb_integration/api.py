@@ -101,7 +101,17 @@ def _first(payload: dict, *names: str) -> str:
 
 
 def _amount(payload: dict) -> float:
-    return flt(_first(payload, "amount", "Amount", "transactionAmount", "TransAmount"))
+    return flt(
+        _first(
+            payload,
+            "amount",
+            "Amount",
+            "transactionAmount",
+            "TransAmount",
+            "debitAmount",
+            "creditAmount",
+        )
+    )
 
 
 def _transaction_reference(payload: dict) -> str:
