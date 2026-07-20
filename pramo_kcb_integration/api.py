@@ -107,6 +107,7 @@ def _amount(payload: dict) -> float:
             "amount",
             "Amount",
             "transactionAmount",
+            "transactionAmt",
             "TransAmount",
             "debitAmount",
             "creditAmount",
@@ -138,6 +139,7 @@ def _invoice_reference(payload: dict) -> str:
         "account_reference",
         "BillRefNumber",
         "billRefNumber",
+        "businessKey",
         "customerReference",
         "externalReference",
     )
@@ -471,9 +473,94 @@ def _create_payment_entry(company: str, config: frappe._dict, payload: dict, inv
     return pe.name
 
 
+def _flatten_kcb(payload: dict) -> dict:
+    """Merge nested KCB structures (Till header/notificationData, STK Body.stkCallback)
+    up to the top level so the flat extractors below can read invoice, amount, etc."""
+    if not isinstance(payload, dict):
+        return {}
+    flat = dict(payload)
+
+    header = payload.get("header")
+    if isinstance(header, dict):
+        for key, value in header.items():
+            flat.setdefault(key, value)
+
+    request_payload = payload.get("requestPayload")
+    if isinstance(request_payload, dict):
+        additional = request_payload.get("additionalData")
+        notification = additional.get("notificationData") if isinstance(additional, dict) else None
+        if isinstance(notification, dict):
+            # notificationData wins: its businessKey is the invoice, not the biller code
+            for key, value in notification.items():
+                flat[key] = value
+
+    body = payload.get("Body")
+    stk = body.get("stkCallback") if isinstance(body, dict) else None
+    if isinstance(stk, dict):
+        for key, value in stk.items():
+            if key != "CallbackMetadata":
+                flat.setdefault(key, value)
+        metadata = stk.get("CallbackMetadata")
+        items = metadata.get("Item") if isinstance(metadata, dict) else None
+        if isinstance(items, list):
+            for item in items:
+                if isinstance(item, dict) and item.get("Name") is not None:
+                    flat.setdefault(item["Name"], item.get("Value"))
+
+    return flat
+
+
+def _ack_flat(transaction_id: str, message: str = "Notification received") -> dict:
+    return {
+        "transactionID": transaction_id or "",
+        "statusCode": "0",
+        "statusMessage": message,
+    }
+
+
+def _ack_till(message_id: str, conversation_id: str, transaction_id: str,
+              status_code: str = "0", message: str = "Notification received") -> dict:
+    return {
+        "header": {
+            "messageID": message_id or "",
+            "originatorConversationID": conversation_id or "",
+            "statusCode": status_code,
+            "statusMessage": message,
+        },
+        "responsePayload": {"transactionInfo": {"transactionId": transaction_id or ""}},
+    }
+
+
+def _validation_response(invoice_name: str, payload: dict, config: frappe._dict) -> dict:
+    transaction_id = _first(payload, "requestId", "messageId") or (invoice_name or "")
+    credit_account = config.get("custom_kcb_invoice_number_base") or ""
+    if not invoice_name:
+        return {
+            "transactionID": transaction_id,
+            "statusCode": "1",
+            "statusMessage": "Bill not found",
+            "CustomerName": "",
+            "billAmount": "0",
+            "currency": "KES",
+            "billType": "PARTIAL",
+            "creditAccountIdentifier": credit_account,
+        }
+    invoice = frappe.get_doc("Sales Invoice", invoice_name)
+    return {
+        "transactionID": transaction_id,
+        "statusCode": "0",
+        "statusMessage": "Success",
+        "CustomerName": invoice.customer_name or invoice.customer,
+        "billAmount": _as_money_string(invoice.outstanding_amount),
+        "currency": invoice.currency or "KES",
+        "billType": "PARTIAL",
+        "creditAccountIdentifier": credit_account,
+    }
+
+
 def handle_callback(endpoint: str) -> dict:
     callback_type = CALLBACK_METHODS.get(endpoint, endpoint)
-    payload = _request_json()
+    payload = _flatten_kcb(_request_json())
     headers = _headers()
     company = _company_for_payload(payload)
     config = _company_config(company)
@@ -481,33 +568,44 @@ def handle_callback(endpoint: str) -> dict:
     invoice_reference = _invoice_reference(payload)
     invoice_name = _find_sales_invoice(invoice_reference)
 
-    if transaction_reference and _log_exists(transaction_reference):
-        return {
-            "status": "SUCCESS",
-            "message": "Duplicate callback ignored",
-            "duplicate": True,
-            "transaction_reference": transaction_reference,
-        }
+    is_validation = endpoint == "kcb_validation"
+    is_till = endpoint == "kcb_till_notification"
+    message_id = _first(payload, "messageID", "messageId")
+    conversation_id = _first(payload, "originatorConversationID")
 
+    # Signature is verified over the raw request body inside _signature_status
     signature_ok, signature_message, signature_header = _signature_status(company, config, payload, headers)
     if not signature_ok:
-        log_name = _write_log(
-            callback_type,
-            company,
-            payload,
-            headers,
-            signature_header,
-            "Rejected",
-            signature_message,
-            invoice_name,
-        )
+        _write_log(callback_type, company, payload, headers, signature_header,
+                   "Rejected", signature_message, invoice_name)
         frappe.local.response["http_status_code"] = 401
-        return {
-            "status": "ERROR",
-            "message": signature_message,
-            "log": log_name,
-        }
+        if is_validation:
+            return _validation_response("", payload, config)
+        if is_till:
+            return _ack_till(message_id, conversation_id, "", "1", signature_message)
+        return {"transactionID": "", "statusCode": "1", "statusMessage": signature_message}
 
+    # Bill-Validation: synchronous lookup, no payment entry, return the bill details KCB needs
+    if is_validation:
+        status = "Verified" if invoice_name else "Pending Manual Review"
+        _write_log(callback_type, company, payload, headers, signature_header, status,
+                   "" if invoice_name else "Invoice not found for validation", invoice_name)
+        return _validation_response(invoice_name, payload, config)
+
+    # Duplicate notification -> acknowledge without re-processing
+    if transaction_reference and _log_exists(transaction_reference):
+        if is_till:
+            return _ack_till(message_id, conversation_id, transaction_reference, "0", "Duplicate ignored")
+        return _ack_flat(transaction_reference, "Duplicate ignored")
+
+    # STK Push result callback: honour ResultCode (0/00 = paid, anything else = cancelled/failed)
+    result_code = _first(payload, "ResultCode", "resultCode")
+    if endpoint == "kcb_mpesa_callback" and result_code and result_code not in ("0", "00"):
+        _write_log(callback_type, company, payload, headers, signature_header, "STK Push Failed",
+                   f"ResultCode {result_code}: " + _first(payload, "ResultDesc", "resultDesc"), invoice_name)
+        return _ack_flat(transaction_reference, "Callback received")
+
+    # Notification (Account / Till / M-Pesa success / FT): create the Payment Entry
     payment_entry = ""
     processing_status = "Verified"
     error_message = ""
@@ -524,26 +622,13 @@ def handle_callback(endpoint: str) -> dict:
         processing_status = "Payment Entry Failed"
         error_message = str(exc)
 
-    log_name = _write_log(
-        callback_type,
-        company,
-        payload,
-        headers,
-        signature_header,
-        processing_status,
-        error_message,
-        invoice_name,
-        payment_entry,
-    )
+    _write_log(callback_type, company, payload, headers, signature_header,
+               processing_status, error_message, invoice_name, payment_entry)
 
-    return {
-        "status": "SUCCESS",
-        "message": processing_status,
-        "log": log_name,
-        "company": company,
-        "sales_invoice": invoice_name,
-        "payment_entry": payment_entry,
-    }
+    transaction_id = payment_entry or transaction_reference or invoice_name or ""
+    if is_till:
+        return _ack_till(message_id, conversation_id, transaction_id, "0", processing_status)
+    return _ack_flat(transaction_id, processing_status)
 
 
 @frappe.whitelist()
