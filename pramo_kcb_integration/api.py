@@ -10,9 +10,11 @@ from frappe.utils.password import get_decrypted_password
 from pramo_kcb_integration.crypto import verify_rsa_signature
 
 
+# Values MUST be valid "KCB Integration Log".callback_type Select options:
+# M-Pesa, Funds Transfer, Till Notification, Account Notification, Validation, STK Push, Other
 CALLBACK_METHODS = {
-    "kcb_mpesa_callback": "M-Pesa Callback",
-    "kcb_mpesa_ipn": "M-Pesa IPN",
+    "kcb_mpesa_callback": "M-Pesa",
+    "kcb_mpesa_ipn": "M-Pesa",
     "kcb_till_notification": "Till Notification",
     "kcb_account_notification": "Account Notification",
     "kcb_ft_callback": "Funds Transfer",
