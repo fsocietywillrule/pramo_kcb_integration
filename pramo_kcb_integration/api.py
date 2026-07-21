@@ -191,6 +191,7 @@ def _company_config(company: str) -> frappe._dict:
         "custom_kcb_auto_submit_payment_entries",
         "custom_kcb_buni_username",
         "custom_kcb_invoice_number_base",
+        "custom_kcb_credit_account",
         "custom_kcb_mpesa_callback_url",
         "custom_kcb_prod_consumer_key",
         "custom_kcb_prod_token_endpoint",
@@ -535,7 +536,10 @@ def _ack_till(message_id: str, conversation_id: str, transaction_id: str,
 
 def _validation_response(invoice_name: str, payload: dict, config: frappe._dict) -> dict:
     transaction_id = _first(payload, "requestId", "messageId") or (invoice_name or "")
-    credit_account = config.get("custom_kcb_invoice_number_base") or ""
+    # KCB (21-Jul-2026): creditAccountIdentifier must be the settlement ACCOUNT NUMBER (1350363375),
+    # not the paybill/invoice base. Falls back to invoice_number_base if account not configured.
+    credit_account = (config.get("custom_kcb_credit_account")
+                      or config.get("custom_kcb_invoice_number_base") or "")
     if not invoice_name:
         return {
             "transactionID": transaction_id,
