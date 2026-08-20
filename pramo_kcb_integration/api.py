@@ -727,7 +727,22 @@ def handle_callback(endpoint: str) -> dict:
             processing_status = "Verified - Log Only"
     except Exception as exc:
         processing_status = "Payment Entry Failed"
-        error_message = str(exc)
+        # str(exc) is empty for validations raised through frappe.throw/msgprint - the
+        # real text lives in frappe.local.message_log. Without this the log said only
+        # "Payment Entry Failed" and the cause was unrecoverable after the fact.
+        parts = [str(exc) or exc.__class__.__name__]
+        try:
+            for entry in (getattr(frappe.local, "message_log", None) or []):
+                text = entry.get("message") if isinstance(entry, dict) else str(entry)
+                if text:
+                    parts.append(str(text))
+        except Exception:
+            pass
+        error_message = " | ".join(parts)[:1000]
+        try:
+            frappe.log_error(frappe.get_traceback(), "KCB Payment Entry Failed")
+        except Exception:
+            pass
 
     _write_log(callback_type, company, payload, headers, signature_header,
                processing_status, error_message, invoice_name, payment_entry)
