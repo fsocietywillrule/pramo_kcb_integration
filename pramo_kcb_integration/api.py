@@ -147,27 +147,53 @@ def _invoice_reference(payload: dict) -> str:
     )
 
 
-def _reference_without_paybill(reference: str) -> str:
+def _known_bill_bases() -> dict:
+    """{invoice_number_base: company}. Only these count as a paybill prefix."""
+    bases = {}
+    for row in frappe.get_all(
+        "Company",
+        filters={"custom_kcb_invoice_number_base": ["!=", ""]},
+        fields=["name", "custom_kcb_invoice_number_base"],
+    ):
+        base = (row.get("custom_kcb_invoice_number_base") or "").strip()
+        if base:
+            bases[base] = row.get("name")
+    return bases
+
+
+def _split_reference(reference: str) -> tuple:
+    """Return (company_from_prefix, invoice_reference).
+
+    A prefix is only stripped when it matches a Company's bill base. "-" is part of
+    every invoice name (SINV-MSA-00028), so splitting on it blindly derived base
+    "SINV", matched no company, and silently fell back to the default company.
+    """
     if not reference:
-        return ""
+        return "", ""
+    reference = reference.strip()
+    bases = _known_bill_bases()
     for separator in ("#", "-"):
         if separator in reference:
-            parts = reference.split(separator, 1)
-            if len(parts) == 2 and parts[1]:
-                return parts[1]
-    return reference
+            head, tail = reference.split(separator, 1)
+            head, tail = head.strip(), tail.strip()
+            if tail and head in bases:
+                return bases[head], tail
+    return "", reference
+
+
+def _reference_without_paybill(reference: str) -> str:
+    return _split_reference(reference)[1]
 
 
 def _company_for_payload(payload: dict) -> str:
-    invoice_reference = _invoice_reference(payload)
-    base = ""
-    if "#" in invoice_reference:
-        base = invoice_reference.split("#", 1)[0]
-    elif "-" in invoice_reference:
-        base = invoice_reference.split("-", 1)[0]
+    company, invoice_reference = _split_reference(_invoice_reference(payload))
+    if company:
+        return company
 
-    if base:
-        company = frappe.db.get_value("Company", {"custom_kcb_invoice_number_base": base}, "name")
+    # No recognised paybill prefix (customer typed the bare invoice number).
+    # Take the company off the invoice itself rather than guessing.
+    if invoice_reference and frappe.db.exists("Sales Invoice", invoice_reference):
+        company = frappe.db.get_value("Sales Invoice", invoice_reference, "company")
         if company:
             return company
 
@@ -220,11 +246,38 @@ def _public_key_for_environment(config: frappe._dict) -> str:
     return config.get("custom_kcb_prod_public_key") or ""
 
 
-def _signature_status(company: str, config: frappe._dict, payload: dict, headers: dict) -> tuple[bool, str, str]:
+def _stk_callback_is_ours(payload: dict) -> bool:
+    """Trust an unsigned STK result only when its CheckoutRequestID matches a push
+    this system actually sent. A forger cannot guess an id we generated."""
+    checkout_id = _first(payload, "CheckoutRequestID", "checkoutRequestID", "checkout_request_id")
+    if not checkout_id:
+        return False
+    if not frappe.db.exists("DocType", "KCB Integration Log"):
+        return False
+    return bool(
+        frappe.db.exists(
+            "KCB Integration Log",
+            {"callback_type": "STK Push", "checkout_request_id": checkout_id},
+        )
+    )
+
+
+def _signature_status(company: str, config: frappe._dict, payload: dict, headers: dict,
+                      endpoint: str = "") -> tuple[bool, str, str]:
     signature = _header_value(headers, "Signature", "X-Signature", "x-kcb-signature")
     env = _environment(config)
     if env.lower() == "sandbox" and not signature:
         return True, "Sandbox request without signature accepted", signature
+
+    # KCB does NOT sign M-Pesa STK result callbacks. Verified against production on
+    # 2026-08-20: the callback carried 13 headers, none of them a signature. Those are
+    # authenticated by matching the CheckoutRequestID back to our own push instead.
+    # Scoped to the endpoint on purpose - kcb_mpesa_ipn shares callback_type "M-Pesa"
+    # but is the C2B paybill path, has no CheckoutRequestID, and MUST stay signed.
+    if endpoint == "kcb_mpesa_callback" and not signature:
+        if _stk_callback_is_ours(payload):
+            return True, "Verified by CheckoutRequestID", signature
+        return False, "Unsigned STK callback with unknown CheckoutRequestID", signature
 
     public_key = _public_key_for_environment(config)
     ok, message = verify_rsa_signature(public_key, signature, _request_body_bytes())
@@ -334,6 +387,16 @@ def _get_access_token(company: str, config: frappe._dict) -> str:
     return token
 
 
+def _stk_id(response_payload: dict, key: str) -> str:
+    """KCB returns the ids nested: {"header": {...}, "response": {"CheckoutRequestID": ...}}."""
+    if not isinstance(response_payload, dict):
+        return ""
+    inner = response_payload.get("response")
+    if isinstance(inner, dict) and inner.get(key):
+        return inner.get(key)
+    return response_payload.get(key) or ""
+
+
 def _insert_stk_log(company: str, invoice_name: str, payload: dict, response_payload: dict, status: str) -> str:
     if not frappe.db.exists("DocType", "KCB Integration Log"):
         frappe.log_error(json.dumps({"request": payload, "response": response_payload}, indent=2), "KCB STK Push")
@@ -353,8 +416,8 @@ def _insert_stk_log(company: str, invoice_name: str, payload: dict, response_pay
     doc.currency = "KES"
     doc.phone_number = payload.get("phoneNumber")
     doc.account_reference = payload.get("invoiceNumber")
-    doc.checkout_request_id = response_payload.get("CheckoutRequestID")
-    doc.merchant_request_id = response_payload.get("MerchantRequestID")
+    doc.checkout_request_id = _stk_id(response_payload, "CheckoutRequestID")
+    doc.merchant_request_id = _stk_id(response_payload, "MerchantRequestID")
     doc.message_id = payload.get("messageId")
     doc.received_on = now_datetime()
     doc.processing_status = _mapped_status(status)
@@ -442,6 +505,12 @@ def _create_payment_entry(company: str, config: frappe._dict, payload: dict, inv
         frappe.throw("KCB default bank account is not configured on Company")
 
     invoice = frappe.get_doc("Sales Invoice", invoice_name)
+    if invoice.company != company:
+        frappe.throw(
+            "KCB routing mismatch: {0} belongs to {1}, callback routed to {2}".format(
+                invoice.name, invoice.company, company
+            )
+        )
     amount = _amount(payload)
     if amount <= 0:
         frappe.throw("KCB amount is missing or zero")
@@ -580,7 +649,8 @@ def handle_callback(endpoint: str) -> dict:
     conversation_id = _first(payload, "originatorConversationID")
 
     # Signature is verified over the raw request body inside _signature_status
-    signature_ok, signature_message, signature_header = _signature_status(company, config, payload, headers)
+    signature_ok, signature_message, signature_header = _signature_status(
+        company, config, payload, headers, endpoint)
     if not signature_ok:
         _write_log(callback_type, company, payload, headers, signature_header,
                    "Rejected", signature_message, invoice_name)
@@ -603,6 +673,15 @@ def handle_callback(endpoint: str) -> dict:
         if is_till:
             return _ack_till(message_id, conversation_id, transaction_reference, "0", "Duplicate ignored")
         return _ack_flat(transaction_reference, "Duplicate ignored")
+
+    # One STK push yields exactly one final result. Block replay of a CheckoutRequestID
+    # so a captured id cannot be re-posted with a forged ResultCode 0.
+    if endpoint == "kcb_mpesa_callback":
+        replay_id = _first(payload, "CheckoutRequestID", "checkoutRequestID", "checkout_request_id")
+        if replay_id and frappe.db.exists(
+            "KCB Integration Log", {"callback_type": "M-Pesa", "checkout_request_id": replay_id}
+        ):
+            return _ack_flat(transaction_reference, "Duplicate ignored")
 
     # STK Push result callback: honour ResultCode (0/00 = paid, anything else = cancelled/failed)
     result_code = _first(payload, "ResultCode", "resultCode")
