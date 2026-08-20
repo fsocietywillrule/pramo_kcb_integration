@@ -246,20 +246,31 @@ def _public_key_for_environment(config: frappe._dict) -> str:
     return config.get("custom_kcb_prod_public_key") or ""
 
 
+def _stk_origin(payload: dict) -> dict:
+    """The outbound STK Push log row this callback came from, found by CheckoutRequestID.
+
+    An M-Pesa STK result callback carries NO invoice reference - Daraja never echoes
+    the account reference back. Verified against production 2026-08-20: the payload
+    holds only Amount, MpesaReceiptNumber, Balance, TransactionDate, PhoneNumber and
+    the two request ids. The only link to the invoice and company is our own push.
+    """
+    checkout_id = _first(payload, "CheckoutRequestID", "checkoutRequestID", "checkout_request_id")
+    if not checkout_id:
+        return {}
+    if not frappe.db.exists("DocType", "KCB Integration Log"):
+        return {}
+    return frappe.db.get_value(
+        "KCB Integration Log",
+        {"callback_type": "STK Push", "checkout_request_id": checkout_id},
+        ["company", "linked_sales_invoice"],
+        as_dict=True,
+    ) or {}
+
+
 def _stk_callback_is_ours(payload: dict) -> bool:
     """Trust an unsigned STK result only when its CheckoutRequestID matches a push
     this system actually sent. A forger cannot guess an id we generated."""
-    checkout_id = _first(payload, "CheckoutRequestID", "checkoutRequestID", "checkout_request_id")
-    if not checkout_id:
-        return False
-    if not frappe.db.exists("DocType", "KCB Integration Log"):
-        return False
-    return bool(
-        frappe.db.exists(
-            "KCB Integration Log",
-            {"callback_type": "STK Push", "checkout_request_id": checkout_id},
-        )
-    )
+    return bool(_stk_origin(payload))
 
 
 def _signature_status(company: str, config: frappe._dict, payload: dict, headers: dict,
@@ -642,6 +653,17 @@ def handle_callback(endpoint: str) -> dict:
     transaction_reference = _transaction_reference(payload)
     invoice_reference = _invoice_reference(payload)
     invoice_name = _find_sales_invoice(invoice_reference)
+
+    # An STK result callback has no invoice reference of its own. Recover the invoice
+    # AND the company from the push we sent, otherwise _company_for_payload falls back
+    # to the default company and a Mombasa payment lands in Kitale's books.
+    if endpoint == "kcb_mpesa_callback":
+        origin = _stk_origin(payload)
+        if origin.get("linked_sales_invoice") and not invoice_name:
+            invoice_name = origin["linked_sales_invoice"]
+        if origin.get("company") and origin["company"] != company:
+            company = origin["company"]
+            config = _company_config(company)
 
     is_validation = endpoint == "kcb_validation"
     is_till = endpoint == "kcb_till_notification"
