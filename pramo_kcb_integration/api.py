@@ -262,9 +262,46 @@ def _stk_origin(payload: dict) -> dict:
     return frappe.db.get_value(
         "KCB Integration Log",
         {"callback_type": "STK Push", "checkout_request_id": checkout_id},
-        ["company", "linked_sales_invoice"],
+        ["company", "linked_sales_invoice", "owner"],
         as_dict=True,
     ) or {}
+
+
+def _can_post_payments(user: str) -> bool:
+    """Could this user create a Payment Entry if they were logged in?"""
+    if not user or user == "Guest":
+        return False
+    if user == "Administrator":
+        return True
+    if not frappe.db.get_value("User", user, "enabled"):
+        return False
+    try:
+        return bool(frappe.has_permission("Payment Entry", "create", user=user))
+    except Exception:
+        return False
+
+
+def _posting_user(company: str, config: frappe._dict, endpoint: str, payload: dict) -> str:
+    """Which user the Payment Entry should be written as.
+
+    A callback arrives as Guest, and Guest cannot create a Payment Entry: ERPNext's
+    get_account_details() runs its own frappe.has_permission("Payment Entry",
+    throw=True), which pe.insert(ignore_permissions=True) never reaches.
+
+    For an STK push we know exactly who asked the customer for the money, so the
+    entry is credited to them. That keeps a real name on the document instead of
+    Administrator, and keeps their Company user permission in force. Direct paybill
+    deposits have no originating user, so they fall back to the configured posting
+    user and finally to Administrator.
+    """
+    candidates = []
+    if endpoint == "kcb_mpesa_callback":
+        candidates.append(_stk_origin(payload).get("owner"))
+    candidates.append(config.get("custom_kcb_posting_user"))
+    for user in candidates:
+        if user and _can_post_payments(user):
+            return user
+    return "Administrator"
 
 
 def _stk_callback_is_ours(payload: dict) -> bool:
@@ -716,8 +753,17 @@ def handle_callback(endpoint: str) -> dict:
     payment_entry = ""
     processing_status = "Verified"
     error_message = ""
+    posting_user = _posting_user(company, config, endpoint, payload)
+    original_user = frappe.session.user
     try:
-        payment_entry = _create_payment_entry(company, config, payload, invoice_name)
+        # Elevated for this insert only - see _posting_user for why Guest cannot do it.
+        # The finally puts the session back before anything else in the request runs,
+        # including the logging below, so nothing outside this call is elevated.
+        frappe.set_user(posting_user)
+        try:
+            payment_entry = _create_payment_entry(company, config, payload, invoice_name)
+        finally:
+            frappe.set_user(original_user)
         if payment_entry:
             processing_status = "Payment Entry Created"
         elif config.get("custom_kcb_auto_create_payments"):
