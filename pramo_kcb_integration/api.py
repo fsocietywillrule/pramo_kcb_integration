@@ -909,3 +909,95 @@ def kcb_ft_callback():
 @frappe.whitelist(allow_guest=True)
 def kcb_validation():
     return handle_callback("kcb_validation")
+
+
+@frappe.whitelist()
+def kcb_payment_status(checkout_request_id: str) -> dict:
+    """Read-only poll of the async M-Pesa outcome for one STK push.
+
+    STRICTLY read-only and additive: it only READS the KCB Integration Log row
+    written by the callback and returns a status dict. It creates, modifies,
+    submits and allocates nothing - every payment posting stays in the untouched
+    callback path. The Sales Invoice Client Script calls this every few seconds
+    after kcb_stk_push so the rep sees whether the customer paid without
+    refreshing the desk. Logged-in staff only (no allow_guest). Never raises on
+    'not found' - it returns the pending state.
+    """
+    pending = {"state": "pending", "detail": "Waiting for customer to approve",
+               "amount": "", "payment_entry": "", "mpesa_receipt": "", "error": ""}
+    if not checkout_request_id:
+        return pending
+    try:
+        if not frappe.db.exists("DocType", "KCB Integration Log"):
+            return pending
+        rows = frappe.get_all(
+            "KCB Integration Log",
+            filters={
+                "checkout_request_id": checkout_request_id,
+                "callback_type": ["in", ["M-Pesa", "Funds Transfer"]],
+            },
+            fields=[
+                "processing_status", "error_message", "linked_payment_entry",
+                "transaction_reference", "retrieval_ref_number", "amount",
+            ],
+            order_by="creation desc",
+            limit_page_length=1,
+        )
+    except Exception:
+        return pending
+
+    if not rows:
+        return pending
+
+    row = rows[0]
+    status = (row.get("processing_status") or "").strip()
+    detail = (row.get("error_message") or status or "").strip()
+    payment_entry = row.get("linked_payment_entry") or ""
+    receipt = row.get("transaction_reference") or row.get("retrieval_ref_number") or ""
+    amount = row.get("amount")
+    amount = "" if amount in (None, "") else str(amount)
+    detail_lower = detail.lower()
+
+    # SUCCESS: the callback landed as Processed. For an STK push that means the
+    # customer approved and the money is confirmed (ResultCode 0). This path never
+    # offers a resend - that is the double-charge guard.
+    if status == "Processed":
+        return {
+            "state": "success",
+            "detail": detail or "Payment received",
+            "amount": amount,
+            "payment_entry": payment_entry,
+            "mpesa_receipt": receipt,
+            "error": "",
+        }
+
+    # FAILED: the callback landed but the money did not post.
+    if status == "Error":
+        error = detail or "Payment failed"
+        allow_resend = True
+        # "Payment Entry Failed" is the one Error where the customer's money may
+        # have arrived but posting threw - a blind resend there double-charges, so
+        # the UI must NOT offer a one-tap resend for it (allow_resend=False).
+        if "payment entry failed" in detail_lower:
+            error = ("Customer may have paid but the Payment Entry did not post - "
+                     "check the KCB Integration Log before resending. " + detail)
+            allow_resend = False
+        return {
+            "state": "failed",
+            "detail": detail,
+            "amount": amount,
+            "payment_entry": payment_entry,
+            "mpesa_receipt": receipt,
+            "error": error,
+            "allow_resend": allow_resend,
+        }
+
+    # Non-terminal / config-hold (Pending Config, blank) -> keep polling.
+    return {
+        "state": "pending",
+        "detail": detail or "Waiting for customer to approve",
+        "amount": amount,
+        "payment_entry": payment_entry,
+        "mpesa_receipt": receipt,
+        "error": "",
+    }
