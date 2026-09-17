@@ -36,6 +36,9 @@ STATUS_MAP = {
     "Payment Entry Failed": "Error",
     "STK Push Sent": "Processed",
     "STK Push Failed": "Error",
+    # pay-before-submit flow
+    "Amount Mismatch - Held": "Pending Config",
+    "Invoice Submit Failed": "Error",
 }
 
 # Mapped statuses that should NOT block a transaction_reference from being
@@ -227,6 +230,11 @@ def _company_config(company: str) -> frappe._dict:
         "custom_kcb_shared_shortcode",
         "custom_kcb_org_shortcode",
         "custom_kcb_org_passkey",
+        # _posting_user reads this; it was missing here so it never applied
+        "custom_kcb_posting_user",
+        # pay-before-submit: STK push from a DRAFT invoice, callback submits it.
+        # Field does not exist until go-live, so this stays inert until then.
+        "custom_kcb_stk_from_draft",
     ]
     existing = {row.get("Field") for row in frappe.db.sql("show columns from `tabCompany`", as_dict=True)}
     usable = [field for field in fields if field in existing]
@@ -593,6 +601,70 @@ def _create_payment_entry(company: str, config: frappe._dict, payload: dict, inv
     return pe.name
 
 
+def _maybe_submit_draft_invoice(config: frappe._dict, payload: dict, invoice_name: str,
+                                endpoint: str) -> tuple[bool, str]:
+    """Pay-before-submit: if the STK push was sent from a DRAFT invoice, submit it
+    now that the customer has paid - but ONLY on an exact amount match.
+
+    Returns (submitted, hold_reason). hold_reason non-empty means the invoice was
+    deliberately left as draft and the caller must NOT create a Payment Entry
+    (ERPNext refuses an allocation against an unsubmitted invoice anyway).
+
+    Guards, in order:
+    - Only the STK result path (kcb_mpesa_callback): that payload was already
+      authenticated by CheckoutRequestID against a push we sent. Paybill/till
+      deposits never submit invoices.
+    - Flag custom_kcb_stk_from_draft must be on for the company.
+    - docstatus re-checked here: the replay/dedupe guards upstream stop double
+      callbacks, and this check makes a double submit impossible even if one slips.
+    - Paid amount must equal the invoice total (rounded_total, else grand_total,
+      VAT-inclusive) within 0.01. Partial or over payment -> held for manual review.
+    """
+    if endpoint != "kcb_mpesa_callback" or not invoice_name:
+        return False, ""
+    if frappe.db.get_value("Sales Invoice", invoice_name, "docstatus") != 0:
+        return False, ""
+    if not config.get("custom_kcb_stk_from_draft"):
+        return False, ("Invoice {0} is draft and pay-before-submit is not enabled "
+                       "for this company".format(invoice_name))
+
+    invoice = frappe.get_doc("Sales Invoice", invoice_name)
+    due = flt(invoice.rounded_total) or flt(invoice.grand_total)
+    paid = _amount(payload)
+    if abs(paid - due) > 0.01:
+        return False, ("Amount mismatch: paid {0} vs invoice total {1} on {2} - "
+                       "held as draft for manual review".format(paid, due, invoice_name))
+
+    invoice.submit()
+    return True, ""
+
+
+def _send_to_etims(invoice_name: str) -> str:
+    """Fire the eTIMS submission for a just-submitted invoice.
+
+    Sales auto-submission is disabled site-wide (Navari KRA eTims Settings,
+    sales_auto_submission_enabled=0), so payment success is the trigger now.
+    Uses the slade app's own whitelisted send_invoice_details. Never raises:
+    the money is already posted, a signing hiccup must not roll it back - it
+    is logged and the desk button can re-send. Respects prevent_etims_submission
+    on the invoice (also the safe lever for end-to-end tests)."""
+    try:
+        if frappe.db.get_value("Sales Invoice", invoice_name, "prevent_etims_submission"):
+            return "eTIMS send skipped: prevent_etims_submission is set"
+        send = frappe.get_attr(
+            "kenya_compliance_via_slade.kenya_compliance_via_slade."
+            "overrides.server.sales_invoice.send_invoice_details"
+        )
+        send(invoice_name)
+        return ""
+    except Exception as exc:
+        try:
+            frappe.log_error(frappe.get_traceback(), "KCB eTIMS send failed")
+        except Exception:
+            pass
+        return "eTIMS send failed: {0}".format(str(exc) or exc.__class__.__name__)[:300]
+
+
 def _flatten_kcb(payload: dict) -> dict:
     """Merge nested KCB structures (Till header/notificationData, STK Body.stkCallback)
     up to the top level so the flat extractors below can read invoice, amount, etc."""
@@ -749,19 +821,47 @@ def handle_callback(endpoint: str) -> dict:
                    f"ResultCode {result_code}: " + _first(payload, "ResultDesc", "resultDesc"), invoice_name)
         return _ack_flat(transaction_reference, "Callback received")
 
-    # Notification (Account / Till / M-Pesa success / FT): create the Payment Entry
+    # Notification (Account / Till / M-Pesa success / FT): submit a pay-before-submit
+    # draft first (STK path only, exact amount), then create the Payment Entry.
     payment_entry = ""
     processing_status = "Verified"
     error_message = ""
+    submitted_here = False
     posting_user = _posting_user(company, config, endpoint, payload)
     original_user = frappe.session.user
     try:
-        # Elevated for this insert only - see _posting_user for why Guest cannot do it.
+        # Elevated for these writes only - see _posting_user for why Guest cannot do it.
         # The finally puts the session back before anything else in the request runs,
         # including the logging below, so nothing outside this call is elevated.
         frappe.set_user(posting_user)
         try:
+            try:
+                submitted_here, hold_reason = _maybe_submit_draft_invoice(
+                    config, payload, invoice_name, endpoint)
+            except Exception:
+                frappe.log_error(frappe.get_traceback(), "KCB invoice submit failed")
+                _write_log(callback_type, company, payload, headers, signature_header,
+                           "Invoice Submit Failed",
+                           "Payment received but invoice submit threw - review "
+                           + (invoice_name or ""), invoice_name)
+                return _ack_till(message_id, conversation_id, transaction_reference, "0",
+                                 "Invoice Submit Failed") if is_till else \
+                    _ack_flat(transaction_reference, "Invoice Submit Failed")
+            if hold_reason:
+                # Money arrived but the draft must not be submitted (flag off, or
+                # partial/over payment). No Payment Entry either - manual review.
+                _write_log(callback_type, company, payload, headers, signature_header,
+                           "Amount Mismatch - Held" if "mismatch" in hold_reason.lower()
+                           else "Pending Manual Review",
+                           hold_reason, invoice_name)
+                return _ack_till(message_id, conversation_id, transaction_reference, "0",
+                                 "Held for review") if is_till else \
+                    _ack_flat(transaction_reference, "Held for review")
             payment_entry = _create_payment_entry(company, config, payload, invoice_name)
+            if submitted_here:
+                etims_note = _send_to_etims(invoice_name)
+                if etims_note:
+                    error_message = etims_note
         finally:
             frappe.set_user(original_user)
         if payment_entry:
@@ -806,13 +906,16 @@ def kcb_stk_push(sales_invoice: str, phone_number: str = "", amount: str = ""):
     invoice = frappe.get_doc("Sales Invoice", sales_invoice)
     invoice.check_permission("read")
 
-    if invoice.docstatus != 1:
-        frappe.throw("Submit the Sales Invoice before sending KCB M-Pesa request")
-
     company = invoice.company
     config = _company_config(company)
     if not config:
         frappe.throw("KCB Company configuration is missing")
+
+    if invoice.docstatus == 2:
+        frappe.throw("Cannot request payment for a cancelled Sales Invoice")
+    if invoice.docstatus == 0 and not config.get("custom_kcb_stk_from_draft"):
+        # pay-before-submit is per-company opt-in; without it the old rule stands
+        frappe.throw("Submit the Sales Invoice before sending KCB M-Pesa request")
 
     phone = _normalize_phone(phone_number or getattr(invoice, "contact_mobile", "") or getattr(invoice, "customer_mobile_no", ""))
     if not phone or not phone.startswith("254") or len(phone) < 12:
