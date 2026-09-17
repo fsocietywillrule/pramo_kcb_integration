@@ -839,6 +839,12 @@ def handle_callback(endpoint: str) -> dict:
                 submitted_here, hold_reason = _maybe_submit_draft_invoice(
                     config, payload, invoice_name, endpoint)
             except Exception:
+                # A failed submit leaves half-written ledger state in the open
+                # transaction (proven in sandbox: NegativeStockError mid-submit,
+                # then the log write's commit persisted docstatus=1 with stock
+                # ledger but no GL). Roll back BEFORE logging so the invoice
+                # stays a clean draft.
+                frappe.db.rollback()
                 frappe.log_error(frappe.get_traceback(), "KCB invoice submit failed")
                 _write_log(callback_type, company, payload, headers, signature_header,
                            "Invoice Submit Failed",
