@@ -235,6 +235,9 @@ def _company_config(company: str) -> frappe._dict:
         # pay-before-submit: STK push from a DRAFT invoice, callback submits it.
         # Field does not exist until go-live, so this stays inert until then.
         "custom_kcb_stk_from_draft",
+        # partial payments: a partial STK on a draft still submits (Partly Paid).
+        # Same inert-until-field-exists pattern.
+        "custom_kcb_allow_partial",
     ]
     existing = {row.get("Field") for row in frappe.db.sql("show columns from `tabCompany`", as_dict=True)}
     usable = [field for field in fields if field in existing]
@@ -602,13 +605,24 @@ def _create_payment_entry(company: str, config: frappe._dict, payload: dict, inv
 
 
 def _maybe_submit_draft_invoice(config: frappe._dict, payload: dict, invoice_name: str,
-                                endpoint: str) -> tuple[bool, str]:
+                                endpoint: str) -> tuple[bool, str, str]:
     """Pay-before-submit: if the STK push was sent from a DRAFT invoice, submit it
-    now that the customer has paid - but ONLY on an exact amount match.
+    now that the customer has paid.
 
-    Returns (submitted, hold_reason). hold_reason non-empty means the invoice was
-    deliberately left as draft and the caller must NOT create a Payment Entry
-    (ERPNext refuses an allocation against an unsubmitted invoice anyway).
+    Amount policy:
+    - custom_kcb_allow_partial OFF (default): ONLY an exact amount match submits;
+      anything else is held (the original behavior, unchanged).
+    - custom_kcb_allow_partial ON: any payment 0 < paid submits. A partial leaves
+      the invoice Partly Paid (ERPNext derives status from outstanding). An
+      overpayment still submits and books - the excess ends up unallocated on the
+      Payment Entry as customer credit (owner decision D2) and is flagged via the
+      returned note. eTIMS signs the FULL invoice at submit either way; later
+      partials ride the ordinary submitted-invoice path and never re-sign.
+
+    Returns (submitted, hold_reason, note). hold_reason non-empty means the invoice
+    was deliberately left as draft and the caller must NOT create a Payment Entry
+    (ERPNext refuses an allocation against an unsubmitted invoice anyway). note is
+    informational (overpayment flag) and goes into the log's error_message.
 
     Guards, in order:
     - Only the STK result path (kcb_mpesa_callback): that payload was already
@@ -617,26 +631,33 @@ def _maybe_submit_draft_invoice(config: frappe._dict, payload: dict, invoice_nam
     - Flag custom_kcb_stk_from_draft must be on for the company.
     - docstatus re-checked here: the replay/dedupe guards upstream stop double
       callbacks, and this check makes a double submit impossible even if one slips.
-    - Paid amount must equal the invoice total (rounded_total, else grand_total,
-      VAT-inclusive) within 0.01. Partial or over payment -> held for manual review.
     """
     if endpoint != "kcb_mpesa_callback" or not invoice_name:
-        return False, ""
+        return False, "", ""
     if frappe.db.get_value("Sales Invoice", invoice_name, "docstatus") != 0:
-        return False, ""
+        return False, "", ""
     if not config.get("custom_kcb_stk_from_draft"):
         return False, ("Invoice {0} is draft and pay-before-submit is not enabled "
-                       "for this company".format(invoice_name))
+                       "for this company".format(invoice_name)), ""
 
     invoice = frappe.get_doc("Sales Invoice", invoice_name)
     due = flt(invoice.rounded_total) or flt(invoice.grand_total)
     paid = _amount(payload)
-    if abs(paid - due) > 0.01:
+    if paid <= 0:
+        return False, ("Zero/negative paid amount {0} on {1} - held as draft "
+                       "for manual review".format(paid, invoice_name)), ""
+    if not config.get("custom_kcb_allow_partial") and abs(paid - due) > 0.01:
         return False, ("Amount mismatch: paid {0} vs invoice total {1} on {2} - "
-                       "held as draft for manual review".format(paid, due, invoice_name))
+                       "held as draft for manual review".format(paid, due, invoice_name)), ""
+
+    note = ""
+    if paid > due + 0.01:
+        note = ("Overpayment: paid {0} vs invoice total {1} on {2} - excess {3} "
+                "left unallocated on the Payment Entry as customer credit".format(
+                    paid, due, invoice_name, round(paid - due, 2)))
 
     invoice.submit()
-    return True, ""
+    return True, "", note
 
 
 def _send_to_etims(invoice_name: str) -> str:
@@ -836,7 +857,7 @@ def handle_callback(endpoint: str) -> dict:
         frappe.set_user(posting_user)
         try:
             try:
-                submitted_here, hold_reason = _maybe_submit_draft_invoice(
+                submitted_here, hold_reason, overpay_note = _maybe_submit_draft_invoice(
                     config, payload, invoice_name, endpoint)
             except Exception:
                 # A failed submit leaves half-written ledger state in the open
@@ -864,10 +885,12 @@ def handle_callback(endpoint: str) -> dict:
                                  "Held for review") if is_till else \
                     _ack_flat(transaction_reference, "Held for review")
             payment_entry = _create_payment_entry(company, config, payload, invoice_name)
+            if overpay_note:
+                error_message = overpay_note
             if submitted_here:
                 etims_note = _send_to_etims(invoice_name)
                 if etims_note:
-                    error_message = etims_note
+                    error_message = (error_message + " | " + etims_note) if error_message else etims_note
         finally:
             frappe.set_user(original_user)
         if payment_entry:
@@ -930,6 +953,16 @@ def kcb_stk_push(sales_invoice: str, phone_number: str = "", amount: str = ""):
     request_amount = flt(amount) if amount not in (None, "") else flt(invoice.outstanding_amount or invoice.rounded_total or invoice.grand_total)
     if request_amount <= 0:
         frappe.throw("Amount must be greater than zero")
+
+    # Owner decision D1: never prompt the customer for MORE than is due. Partial
+    # (less than due) is allowed here; whether a partial can submit a draft is the
+    # callback's custom_kcb_allow_partial decision, not the push's.
+    due = flt(invoice.outstanding_amount) if invoice.docstatus == 1 else (
+        flt(invoice.rounded_total) or flt(invoice.grand_total))
+    if due > 0 and request_amount > due + 0.01:
+        frappe.throw(
+            "Amount {0} exceeds the amount due {1} on {2} - enter an amount up to the due amount".format(
+                _as_money_string(request_amount), _as_money_string(due), invoice.name))
 
     base = config.get("custom_kcb_invoice_number_base") or ""
     if not base:

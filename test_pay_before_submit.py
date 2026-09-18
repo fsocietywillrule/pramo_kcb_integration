@@ -1,22 +1,24 @@
-"""Offline check of the pay-before-submit flow. No Frappe bench, no site, no KRA:
-frappe/erpnext are stubbed, so this proves the decision logic only.
+"""Offline check of the pay-before-submit + partial-payments flow. No Frappe
+bench, no site, no KRA: frappe/erpnext are stubbed, so this proves the decision
+logic only.
 Run: python test_pay_before_submit.py
 """
 import sys
 import types
 
 
-# ---------- frappe stub ----------------------------------------------------
 class _Throw(Exception):
     pass
 
 
 class FakeInvoice:
     def __init__(self, docstatus=0, rounded_total=1160.0, grand_total=1160.0,
-                 prevent_etims_submission=0, name="SINV-TEST-0001"):
+                 outstanding_amount=0.0, prevent_etims_submission=0,
+                 name="SINV-TEST-0001"):
         self.docstatus = docstatus
         self.rounded_total = rounded_total
         self.grand_total = grand_total
+        self.outstanding_amount = outstanding_amount
         self.prevent_etims_submission = prevent_etims_submission
         self.name = name
         self.company = "PRAMO TRADERS LIMITED"
@@ -41,6 +43,7 @@ def make_frappe(invoice):
     db.exists = lambda *a, **k: True
     db.sql = lambda *a, **k: []
     db.commit = lambda: None
+    db.rollback = lambda: None
     frappe.db = db
 
     frappe.get_doc = lambda dt, name=None: invoice
@@ -65,7 +68,7 @@ def make_frappe(invoice):
     password.get_decrypted_password = lambda *a, **k: ""
 
     calls = {"etims": []}
-    frappe.get_attr = lambda path: calls["etims"].append  # send() records the name
+    frappe.get_attr = lambda path: calls["etims"].append
     return frappe, utils, password, calls
 
 
@@ -76,6 +79,7 @@ def load_api(frappe, utils, password):
     sys.modules.update({
         "frappe": frappe, "frappe.utils": utils, "frappe.utils.password": password,
         "pramo_kcb_integration": pkg, "pramo_kcb_integration.crypto": crypto,
+        "requests": types.ModuleType("requests"),
     })
     import importlib.util
     spec = importlib.util.spec_from_file_location(
@@ -86,84 +90,127 @@ def load_api(frappe, utils, password):
     return api
 
 
-def flag_config(api, on=True):
+def flag_config(api, on=True, partial=False):
     return api.frappe._dict({"custom_kcb_stk_from_draft": 1 if on else 0,
+                             "custom_kcb_allow_partial": 1 if partial else 0,
                              "custom_kcb_auto_create_payments": 1})
 
 
-PAY = {"Amount": "1160", "CheckoutRequestID": "ws_CO_1"}
+def fresh(docstatus=0, **kw):
+    inv = FakeInvoice(docstatus=docstatus, **kw)
+    frappe, utils, password, calls = make_frappe(inv)
+    api = load_api(frappe, utils, password)
+    return inv, api, calls
+
+
+PAY_EXACT = {"Amount": "1160", "CheckoutRequestID": "ws_CO_1"}
+PAY_PART = {"Amount": "800", "CheckoutRequestID": "ws_CO_2"}
+PAY_OVER = {"Amount": "1500", "CheckoutRequestID": "ws_CO_3"}
+CB = "kcb_mpesa_callback"
 
 
 def main():
-    # 1. exact amount -> submit
-    inv = FakeInvoice(docstatus=0)
-    frappe, utils, password, calls = make_frappe(inv)
-    api = load_api(frappe, utils, password)
-    ok, hold = api._maybe_submit_draft_invoice(flag_config(api), PAY, inv.name, "kcb_mpesa_callback")
-    assert ok and not hold and inv.submitted, (ok, hold, inv.submitted)
+    # 1. exact amount, partial flag off -> submit, no note (original flow unchanged)
+    inv, api, _ = fresh()
+    ok, hold, note = api._maybe_submit_draft_invoice(flag_config(api), PAY_EXACT, inv.name, CB)
+    assert ok and not hold and not note and inv.submitted
 
-    # 2. wrong amount -> held, NOT submitted
-    inv = FakeInvoice(docstatus=0)
-    frappe, utils, password, calls = make_frappe(inv)
-    api = load_api(frappe, utils, password)
-    ok, hold = api._maybe_submit_draft_invoice(flag_config(api), {"Amount": "500"}, inv.name, "kcb_mpesa_callback")
-    assert not ok and "mismatch" in hold.lower() and not inv.submitted, (ok, hold)
+    # 2. partial, partial flag OFF -> held draft (original guard unchanged)
+    inv, api, _ = fresh()
+    ok, hold, note = api._maybe_submit_draft_invoice(flag_config(api), PAY_PART, inv.name, CB)
+    assert not ok and "mismatch" in hold.lower() and not inv.submitted
 
-    # 3. flag off -> held draft
-    inv = FakeInvoice(docstatus=0)
-    frappe, utils, password, calls = make_frappe(inv)
-    api = load_api(frappe, utils, password)
-    ok, hold = api._maybe_submit_draft_invoice(flag_config(api, on=False), PAY, inv.name, "kcb_mpesa_callback")
-    assert not ok and hold and not inv.submitted, (ok, hold)
+    # 3. partial, partial flag ON -> SUBMITS (Partly Paid comes from ERPNext outstanding)
+    inv, api, _ = fresh()
+    ok, hold, note = api._maybe_submit_draft_invoice(flag_config(api, partial=True), PAY_PART, inv.name, CB)
+    assert ok and not hold and not note and inv.submitted
 
-    # 4. second callback after submit (double-fire) -> no-op, no double submit
-    inv = FakeInvoice(docstatus=1)
-    frappe, utils, password, calls = make_frappe(inv)
-    api = load_api(frappe, utils, password)
-    ok, hold = api._maybe_submit_draft_invoice(flag_config(api), PAY, inv.name, "kcb_mpesa_callback")
-    assert not ok and not hold and not inv.submitted, (ok, hold)
+    # 4. exact, partial flag ON -> submits, no note
+    inv, api, _ = fresh()
+    ok, hold, note = api._maybe_submit_draft_invoice(flag_config(api, partial=True), PAY_EXACT, inv.name, CB)
+    assert ok and not hold and not note and inv.submitted
 
-    # 5. non-STK endpoint never submits
-    inv = FakeInvoice(docstatus=0)
-    frappe, utils, password, calls = make_frappe(inv)
-    api = load_api(frappe, utils, password)
-    ok, hold = api._maybe_submit_draft_invoice(flag_config(api), PAY, inv.name, "kcb_till_notification")
+    # 5. overpay, partial flag ON -> submits + overpayment note (D2: book, flag, don't hold)
+    inv, api, _ = fresh()
+    ok, hold, note = api._maybe_submit_draft_invoice(flag_config(api, partial=True), PAY_OVER, inv.name, CB)
+    assert ok and not hold and "Overpayment" in note and "340.0" in note and inv.submitted, note
+
+    # 6. overpay, partial flag OFF -> held (unchanged)
+    inv, api, _ = fresh()
+    ok, hold, note = api._maybe_submit_draft_invoice(flag_config(api), PAY_OVER, inv.name, CB)
+    assert not ok and "mismatch" in hold.lower() and not inv.submitted
+
+    # 7. zero amount -> held either way
+    inv, api, _ = fresh()
+    ok, hold, note = api._maybe_submit_draft_invoice(flag_config(api, partial=True),
+                                                     {"Amount": "0", "CheckoutRequestID": "x"}, inv.name, CB)
+    assert not ok and "zero" in hold.lower() and not inv.submitted
+
+    # 8. pay-before-submit flag off -> held draft
+    inv, api, _ = fresh()
+    ok, hold, note = api._maybe_submit_draft_invoice(flag_config(api, on=False, partial=True), PAY_EXACT, inv.name, CB)
+    assert not ok and hold and not inv.submitted
+
+    # 9. second callback after submit (double-fire) -> no-op
+    inv, api, _ = fresh(docstatus=1)
+    ok, hold, note = api._maybe_submit_draft_invoice(flag_config(api, partial=True), PAY_PART, inv.name, CB)
     assert not ok and not hold and not inv.submitted
 
-    # 6. eTIMS: sent normally, skipped on prevent flag, swallowed on failure
-    inv = FakeInvoice(docstatus=1)
-    frappe, utils, password, calls = make_frappe(inv)
-    api = load_api(frappe, utils, password)
+    # 10. non-STK endpoint never submits
+    inv, api, _ = fresh()
+    ok, hold, note = api._maybe_submit_draft_invoice(flag_config(api, partial=True), PAY_EXACT, inv.name, "kcb_till_notification")
+    assert not ok and not hold and not inv.submitted
+
+    # 11. eTIMS: sent normally, skipped on prevent flag, swallowed on failure
+    inv, api, calls = fresh(docstatus=1)
     assert api._send_to_etims(inv.name) == "" and calls["etims"] == [inv.name]
     inv.prevent_etims_submission = 1
-    note = api._send_to_etims(inv.name)
-    assert "skipped" in note and calls["etims"] == [inv.name]
+    assert "skipped" in api._send_to_etims(inv.name) and calls["etims"] == [inv.name]
     inv.prevent_etims_submission = 0
-    frappe.get_attr = lambda path: (_ for _ in ()).throw(RuntimeError("slade down"))
-    note = api._send_to_etims(inv.name)
-    assert note.startswith("eTIMS send failed"), note
+    api.frappe.get_attr = lambda path: (_ for _ in ()).throw(RuntimeError("down"))
+    assert api._send_to_etims(inv.name).startswith("eTIMS send failed")
 
-    # 7. push gate: draft + no flag -> old throw; draft + flag -> passes the gate
-    sys.modules["requests"] = types.ModuleType("requests")  # imported inside kcb_stk_push
-    inv = FakeInvoice(docstatus=0)
+    # 12. push gate: draft without pay-before-submit flag -> old throw
+    inv, api, _ = fresh()
     inv.check_permission = lambda p: None
-    frappe, utils, password, calls = make_frappe(inv)
-    api = load_api(frappe, utils, password)
     api._company_config = lambda c: flag_config(api, on=False)
     try:
         api.kcb_stk_push(inv.name, "254700000000")
         raise AssertionError("draft push allowed without flag")
     except _Throw as e:
         assert "Submit the Sales Invoice" in str(e)
-    api._company_config = lambda c: flag_config(api, on=True)
+
+    # 13. push gate D1: amount above due -> reject with clear message (draft, flag on)
+    inv, api, _ = fresh()
     inv.check_permission = lambda p: None
+    api._company_config = lambda c: flag_config(api, partial=True)
     try:
-        api.kcb_stk_push(inv.name, "bad-phone")  # passes docstatus gate, dies on phone
+        api.kcb_stk_push(inv.name, "254700000000", amount="2000")
+        raise AssertionError("overpay push allowed")
+    except _Throw as e:
+        assert "exceeds the amount due" in str(e), str(e)
+
+    # 14. push: partial amount below due passes the amount gates (dies later on token config)
+    inv, api, _ = fresh()
+    inv.check_permission = lambda p: None
+    api._company_config = lambda c: flag_config(api, partial=True)
+    try:
+        api.kcb_stk_push(inv.name, "254700000000", amount="800")
         raise AssertionError("unreachable")
     except _Throw as e:
-        assert "phone" in str(e).lower(), str(e)
+        assert "exceeds" not in str(e) and "Amount must be" not in str(e), str(e)
 
-    print("ALL PAY-BEFORE-SUBMIT CHECKS PASSED")
+    # 15. push on SUBMITTED invoice: due = outstanding (overpay vs outstanding rejected)
+    inv, api, _ = fresh(docstatus=1, outstanding_amount=360.0)
+    inv.check_permission = lambda p: None
+    api._company_config = lambda c: flag_config(api, partial=True)
+    try:
+        api.kcb_stk_push(inv.name, "254700000000", amount="500")
+        raise AssertionError("overpay vs outstanding allowed")
+    except _Throw as e:
+        assert "exceeds the amount due" in str(e), str(e)
+
+    print("ALL PARTIAL-PAYMENT CHECKS PASSED (15)")
 
 
 if __name__ == "__main__":
